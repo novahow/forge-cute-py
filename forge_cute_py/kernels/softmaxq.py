@@ -128,11 +128,14 @@ class Softmax:
             (rows_in_block, threads_per_row),
             order=(1, 0),
         )
+        REGISTER_LIMIT = 64
+        maxN = min(num_threads * REGISTER_LIMIT, self.N)
         layout_v = cute.make_ordered_layout((1, vecsize), order=(1,0))
         tiled_copy = cute.make_tiled_copy_tv(cpy_atom, layout_t, layout_v)
-        tiler_mn = (rows_in_block, self.N)
+        tiler_mn = (rows_in_block, maxN)
         blocks = cute.ceil_div(mX.shape[0], tiler_mn[0])
         print(num_threads, tiler_mn)
+        
         num_threads = tiled_copy.size
         print(num_threads)
         self.kernel2(mX, mO, tiler_mn, tiled_copy, threads_per_row).launch(
@@ -161,9 +164,11 @@ class Softmax:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
-        shape = mX.shape
-        gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
-        gO = cute.local_tile(mO, tiler_mn, (bidx, 0))
+        # shape = mX.shape
+        tiler_coord = (bidx, None)
+       
+        gX = cute.local_tile(mX,  cute.select(tiler_mn, mode=[0,1]), cute.select(tiler_coord, mode=[0, 1])) # (rows_in_block, maxN, k)
+        gO = cute.local_tile(mO, tiler_mn, (bidx, None))
         print("gX:", gX.layout, tiler_mn, tv_layout.shape)
         # cute.printf(gX)
         smem = cutlass.utils.SmemAllocator()
@@ -179,47 +184,71 @@ class Softmax:
         )
 
         thr_copy = tiled_copy.get_slice(tidx)
-        tXgX = thr_copy.partition_S(gX) # ((vecsize, 1), 1, num_blocks_N)
-        print("tXgX:", tXgX.layout, tiled_copy)
-        tXsX = thr_copy.partition_D(sX)
-        print("tXsX:", tXsX.layout, tiled_copy)
-        tOgO = thr_copy.partition_S(gO)
-        tXrX = cute.make_fragment_like(tXsX)
-        tOrO = cute.make_fragment_like(tOgO)
-
         cpy_atom = cute.make_copy_atom(
             # cpasync.CopyG2SOp(),
             cute.nvgpu.CopyUniversalOp(),
             mX.element_type,
-            num_bits_per_copy=mX.element_type.width * tXgX.shape[0][0],
+            num_bits_per_copy=mX.element_type.width * tv_layout.shape[-1],
         )
-        cute.copy(cpy_atom, tXgX, tXrX)
-        x = tXrX.load().to(cute.Float32)
-
         reduction_buffer_shape = make_reduction_buffer_layout(tv_layout)
         reduction_buffer_mx = smem.allocate_tensor(
-            x.element_type,
+            cute.Float32,
             cute.make_ordered_layout(reduction_buffer_shape, order=(1,0)), 
-            byte_alignment=x.element_type.width
+            byte_alignment=cute.Float32.width
         )
         reduction_buffer_sum = smem.allocate_tensor(
-            x.element_type,
+            cute.Float32,
             cute.make_ordered_layout(reduction_buffer_shape, order=(1,0)), 
-            byte_alignment=x.element_type.width
-        )
-        # cute.autovec
-
-        max_x, sum_exp_x, exp_x = online_softmax_reduce(
-            x, 
-            threads_per_row, 
-            reduction_buffer_mx, 
-            reduction_buffer_sum
+            byte_alignment=cute.Float32.width
         )
 
-        y = exp_x * cute.arch.rcp_approx(sum_exp_x)
-        # store tensorSSA back to register
-        tOrO.store(y.to(tOrO.element_type))
-        cute.copy(cpy_atom, tOrO, tOgO)
+        max_x_final = -Float32.inf
+        sum_exp_x_final = 0.0
+        for k in cutlass.range(gX.shape[-1]):
+            tXgX = thr_copy.partition_S(gX[None, None, k]) # ((vecsize, 1), 1, num_blocks_N)
+            print("tXgX:", tXgX.layout, tiled_copy)
+            tXsX = thr_copy.partition_D(sX)
+            print("tXsX:", tXsX.layout, tiled_copy)
+            tOgO = thr_copy.partition_S(gO[None, None, k])
+            tXrX = cute.make_fragment_like(tXsX)
+            tOrO = cute.make_fragment_like(tOgO)
+
+            cute.copy(cpy_atom, tXgX, tXrX)
+            x = tXrX.load().to(cute.Float32)
+
+            # cute.autovec
+
+            max_x, sum_exp_x, exp_x = online_softmax_reduce(
+                x, 
+                threads_per_row, 
+                reduction_buffer_mx, 
+                reduction_buffer_sum
+            )
+            cur_max = cute.arch.fmax(max_x, max_x_final)
+            scale_old = cute.math.exp(max_x_final - cur_max, fastmath=True)
+            scale_curr = cute.math.exp(max_x - cur_max, fastmath=True)
+            max_x_final = cur_max
+            sum_exp_x_final = sum_exp_x_final * scale_old + sum_exp_x * scale_curr
+            y = x
+            # store tensorSSA back to register
+            # tOrO.store(y.to(tOrO.element_type))
+            # cute.copy(cpy_atom, tOrO, tOgO)
+
+        for k in range(gX.shape[-1]):
+            tXgX = thr_copy.partition_S(gX[None, None, k]) # ((vecsize, 1), 1, num_blocks_N)
+            tXsX = thr_copy.partition_D(sX)
+            tOgO = thr_copy.partition_S(gO[None, None, k])
+            tXrX = cute.make_fragment_like(tXsX)
+            tOrO = cute.make_fragment_like(tOgO)
+
+            cute.copy(cpy_atom, tXgX, tXrX)
+            x = tXrX.load().to(cute.Float32)
+            log2_e = math.log2(math.e)
+            exp_x = cute.math.exp2(x * log2_e - (max_x_final * log2_e), fastmath=True)
+            y = exp_x * cute.arch.rcp_approx(sum_exp_x_final)
+            # store tensorSSA back to register
+            tOrO.store(y.to(tOrO.element_type))
+            cute.copy(cpy_atom, tOrO, tOgO)
 
 
 class SoftmaxBackward:
@@ -349,7 +378,7 @@ class SoftmaxBackward:
 
 if __name__ == '__main__':
     M = 4096
-    N = 1024
+    N = 16 * 1024
     dtype = torch.float16
 
     x = torch.randn(M, N, device='cuda', dtype=dtype)
